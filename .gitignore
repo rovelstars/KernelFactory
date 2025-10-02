@@ -1,0 +1,49 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, coverage and test output
+*.test
+*.out
+*.coverprofile
+coverage.out
+coverage.html
+
+# Build directories
+/bin/
+/pkg/
+
+# Dependency directories
+/vendor/
+/Godeps/
+
+# Local configuration, environment files
+.env
+.env.*.local
+
+# Editor/IDE files
+.idea/
+.vscode/
+*.iml
+*.sublime-workspace
+*.sublime-project
+*~ 
+*.swp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Generated protobufs or other generated code (uncomment if generated files should be ignored)
+# *.pb.go
+
+#output
+output/
+build/
+*.tar.*
