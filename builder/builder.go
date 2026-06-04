@@ -1,93 +1,209 @@
 package builder
 
-import "fmt"
-import "os"
-import "path/filepath"
-import "KernelFactory/utils"
-import "os/exec"
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
 
-func BuildKernel(out *os.File, version, src string) {
-	fmt.Println("Building kernel...")
-	//return full path of current working directory, not ".", but /home/ren/coding/KernelFactory
-	pwd := filepath.Dir(out.Name())
-	pwd, _ = filepath.Abs(pwd)
-	fmt.Printf("Current working directory: %s\n", pwd)
-	// Extract the tar.xz file
-	fmt.Printf("Extracting %s to %s\n", out.Name(), src)
+	"KernelFactory/utils"
+)
 
-	err := utils.ExtractTar(out.Name(), src)
+// kernelRelease asks the kernel build for its true release string (VERSION +
+// localversion), e.g. "6.17.0-runixos-26.2". This is the single source of
+// truth for module directory names, so kernel and NVIDIA modules always agree.
+// Must be called after the config is in place.
+func kernelRelease(kernelSrc string) (string, error) {
+	out, err := exec.Command("make", "-s", "-C", kernelSrc, "kernelrelease").Output()
 	if err != nil {
-		fmt.Println("Error extracting kernel:", err)
-		return
+		return "", fmt.Errorf("make kernelrelease: %w", err)
 	}
+	return strings.TrimSpace(string(out)), nil
+}
 
-	fmt.Println("Kernel extracted successfully")
-	// Set local version
-	err = SetLocalVersion(fmt.Sprintf("%s/linux-%s", src, version), "-rovelos-1")
-	if err != nil {
-		fmt.Println("Error setting local version:", err)
-		return
+// reproducibleEnv returns kbuild env vars that make the build deterministic.
+func reproducibleEnv() []string {
+	env := []string{
+		"KBUILD_BUILD_USER=runixos",
+		"KBUILD_BUILD_HOST=rovelstars",
 	}
-
-	fmt.Println("Local version set successfully")
-
-	/* START BORE PATCH */
-	pathURL := "https://raw.githubusercontent.com/firelzrd/bore-scheduler/refs/heads/main/patches/stable/linux-6.17-bore/0001-linux6.17-rc4-bore-6.5.5.patch"
-	patchPath := fmt.Sprintf("%s/linux-%s/bore.patch", src, version)
-	if _, err := os.Stat(patchPath); os.IsNotExist(err) {
-		cmd := exec.Command("wget", "-O", patchPath, pathURL)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		err = cmd.Run()
-		if err != nil {
-			fmt.Println("Error downloading bore patch:", err)
-			return
+	if sde := os.Getenv("SOURCE_DATE_EPOCH"); sde != "" {
+		if n, err := strconv.ParseInt(sde, 10, 64); err == nil {
+			ts := time.Unix(n, 0).UTC().Format("Mon Jan 2 15:04:05 UTC 2006")
+			env = append(env, "KBUILD_BUILD_TIMESTAMP="+ts)
 		}
 	}
-	cmd := exec.Command("patch", "-p1", "-i", "./bore.patch")
-	cmd.Dir = fmt.Sprintf("%s/linux-%s", src, version)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	err = cmd.Run()
-	if err != nil {
-		fmt.Println("Error applying bore patch:", err)
-		return
-	}
-	fmt.Println("Bore patch applied successfully")
-	/* END BORE PATCH */
+	return env
+}
 
-	utils.MakeWithAllCores(fmt.Sprintf("%s/linux-%s", src, version), "defconfig")
-	cmd = exec.Command("bash", "-lc", "scripts/kconfig/merge_config.sh -m .config THECONFIG")
-	cmd.Dir = fmt.Sprintf("%s/linux-%s", src, version)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	err = cmd.Run()
-	if err != nil {
-		fmt.Println("Error merging config:", err)
-		return
+func destDir(fallbackSrc string) string {
+	if d := os.Getenv("DESTDIR"); d != "" {
+		return d
 	}
-	utils.MakeWithAllCores(fmt.Sprintf("%s/linux-%s", src, version), "olddefconfig")
-	utils.MakeWithAllCores(fmt.Sprintf("%s/linux-%s", src, version), "bzImage modules")
-	utils.MakeWithAllCores(fmt.Sprintf("%s/linux-%s", src, version), "install", fmt.Sprintf("INSTALL_PATH=%s/%s/boot", pwd, src))
-	utils.MakeWithAllCores(fmt.Sprintf("%s/linux-%s", src, version), "modules_install", fmt.Sprintf("INSTALL_MOD_PATH=%s/%s/modules", pwd, src))
+	return fallbackSrc
+}
+
+// BuildKernel extracts, patches, configures, builds and installs the kernel.
+// borePatchURL is optional; when empty the BORE scheduler patch is skipped.
+func BuildKernel(kernelPath, kernelVersion, runixosVersion, src, borePatchURL string) error {
+	fmt.Println("Building kernel...")
+	absSrc, err := filepath.Abs(src)
+	if err != nil {
+		return fmt.Errorf("resolve src: %w", err)
+	}
+
+	fmt.Printf("Extracting %s to %s\n", kernelPath, absSrc)
+	if err := utils.ExtractTar(kernelPath, absSrc); err != nil {
+		return fmt.Errorf("extract kernel: %w", err)
+	}
+
+	kernelSrc := filepath.Join(absSrc, "linux-"+kernelVersion)
+
+	localVersion := fmt.Sprintf("-runixos-%s", runixosVersion)
+	if err := SetLocalVersion(kernelSrc, localVersion); err != nil {
+		return fmt.Errorf("set local version: %w", err)
+	}
+
+	if borePatchURL != "" {
+		if err := applyBorePatch(kernelSrc, borePatchURL); err != nil {
+			return fmt.Errorf("bore patch: %w", err)
+		}
+	} else {
+		fmt.Println("No bore_patch_url in config; skipping BORE patch")
+	}
+
+	buildEnv := reproducibleEnv()
+
+	// Config: start from defconfig, merge our fragment, normalise.
+	if err := utils.Make(kernelSrc, "defconfig", buildEnv...); err != nil {
+		return err
+	}
+	mergeScript := filepath.Join(kernelSrc, "scripts/kconfig/merge_config.sh")
+	if err := utils.Run(kernelSrc, mergeScript, []string{"-m", ".config", "THECONFIG"}, buildEnv...); err != nil {
+		return fmt.Errorf("merge config: %w", err)
+	}
+	if err := utils.Make(kernelSrc, "olddefconfig", buildEnv...); err != nil {
+		return err
+	}
+
+	// Build image + modules.
+	if err := utils.Make(kernelSrc, "bzImage modules", buildEnv...); err != nil {
+		return err
+	}
+
+	release, err := kernelRelease(kernelSrc)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Kernel release: %s\n", release)
+
+	dst := destDir(absSrc)
+
+	// Kernel image -> Core/Startup
+	if err := utils.Make(kernelSrc, "install",
+		append(buildEnv, "INSTALL_PATH="+dst+"/Core/Startup")...); err != nil {
+		return err
+	}
+
+	// Modules -> Core/LibKit/modules/<release>. MODLIB is set explicitly so
+	// modules land directly there (kbuild would otherwise append lib/modules),
+	// and so NVIDIA modules install alongside the kernel's.
+	modlib := fmt.Sprintf("%s/Core/LibKit/modules/%s", dst, release)
+	if err := utils.Make(kernelSrc, "modules_install",
+		append(buildEnv, "MODLIB="+modlib)...); err != nil {
+		return err
+	}
+
+	// UAPI headers -> Core/APIHeader (all of include/, not just a few dirs).
+	if err := installHeaders(kernelSrc, dst, buildEnv); err != nil {
+		return err
+	}
+
+	return writeRunixOSRelease(dst, runixosVersion, kernelVersion, release)
+}
+
+func applyBorePatch(kernelSrc, url string) error {
+	patchPath := filepath.Join(kernelSrc, "bore.patch")
+	if _, err := os.Stat(patchPath); os.IsNotExist(err) {
+		if err := utils.Run("", "wget", []string{"-O", patchPath, url}); err != nil {
+			return fmt.Errorf("download bore patch: %w", err)
+		}
+	}
+	if err := utils.Run(kernelSrc, "patch", []string{"-p1", "-i", patchPath}); err != nil {
+		return fmt.Errorf("apply bore patch: %w", err)
+	}
+	fmt.Println("BORE patch applied")
+	return nil
+}
+
+func installHeaders(kernelSrc, dst string, buildEnv []string) error {
+	hdrTmp := filepath.Join(dst, "Core/.hdrtmp")
+	if err := utils.Make(kernelSrc, "headers_install",
+		append(buildEnv, "INSTALL_HDR_PATH="+hdrTmp)...); err != nil {
+		return err
+	}
+	includeDir := filepath.Join(hdrTmp, "include")
+	entries, err := os.ReadDir(includeDir)
+	if err != nil {
+		return fmt.Errorf("read kernel headers: %w", err)
+	}
+	apiHeader := filepath.Join(dst, "Core/APIHeader")
+	if err := os.MkdirAll(apiHeader, 0755); err != nil {
+		return err
+	}
+	for _, e := range entries {
+		from := filepath.Join(includeDir, e.Name())
+		to := filepath.Join(apiHeader, e.Name())
+		os.RemoveAll(to)
+		if err := os.Rename(from, to); err != nil {
+			return fmt.Errorf("move kernel headers %s: %w", e.Name(), err)
+		}
+	}
+	os.RemoveAll(hdrTmp)
+	return nil
+}
+
+// writeRunixOSRelease creates /Core/Config/OSReleaseInfo.
+func writeRunixOSRelease(dst, runixosVersion, kernelVersion, release string) error {
+	configDir := filepath.Join(dst, "Core/Config")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		return err
+	}
+
+	content := fmt.Sprintf(`NAME="RunixOS"
+ID=runixos
+VERSION=%s
+PRETTY_NAME="RunixOS %s"
+HOME_URL="https://os.rovelstars.com"
+BUG_REPORT_URL="https://os.rovelstars.com/bugreport"
+VENDOR="RovelStars"
+KERNEL_VERSION=%s
+KERNEL_RELEASE=%s
+`, runixosVersion, runixosVersion, kernelVersion, release)
+
+	path := filepath.Join(configDir, "OSReleaseInfo")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		return fmt.Errorf("write OSReleaseInfo: %w", err)
+	}
+	fmt.Printf("Created %s\n", path)
+	return nil
 }
 
 func SetLocalVersion(src, ver string) error {
-	f, err := os.Create(fmt.Sprintf("%s/localversion", src))
-	if err != nil {
-		return fmt.Errorf("failed to create localversion file: %v", err)
+	if err := os.WriteFile(filepath.Join(src, "localversion"), []byte(ver), 0644); err != nil {
+		return fmt.Errorf("write localversion: %w", err)
 	}
-	defer f.Close()
-	_, err = f.WriteString(ver)
-	if err != nil {
-		return fmt.Errorf("failed to write to localversion file: %v", err)
+	if err := os.WriteFile(filepath.Join(src, "THECONFIG"), []byte(theConfig), 0644); err != nil {
+		return fmt.Errorf("write THECONFIG: %w", err)
 	}
-	f, err = os.Create(fmt.Sprintf("%s/THECONFIG", src))
-	if err != nil {
-		return fmt.Errorf("failed to create THECONFIG file: %v", err)
-	}
-	defer f.Close()
-	_, err = f.WriteString(`# === Timer & Preemption (Hybrid Tickless - Windows like) ===
+	return nil
+}
+
+// theConfig is the RunixOS kernel config fragment merged on top of defconfig.
+const theConfig = `# === Timer & Preemption (Hybrid Tickless - Windows like) ===
 CONFIG_HZ_250=y                # Base tick: 250Hz (4ms) balanced
 CONFIG_HZ=250
 CONFIG_PREEMPT_VOLUNTARY=y     # Like Windows, preempt but not fully RT
@@ -264,45 +380,51 @@ CONFIG_ANDROID_BINDER_DEVICES="binder,hwbinder,vndbinder"
 
 # === Miscellaneous ===
 CONFIG_NTSYNC=y
-`)
+`
+
+// BuildNvidiaDriver builds the NVIDIA open-gpu-kernel-modules against the
+// freshly built kernel and installs them next to the kernel's own modules.
+// These modules only load when matching NVIDIA hardware is present, so building
+// them is harmless on non-NVIDIA machines.
+func BuildNvidiaDriver(driverPath, version, kernelVersion, runixosVersion, src string) error {
+	fmt.Println("Building NVIDIA driver...")
+	absSrc, err := filepath.Abs(src)
 	if err != nil {
-		return fmt.Errorf("failed to write to THECONFIG file: %v", err)
+		return fmt.Errorf("resolve src: %w", err)
+	}
+
+	fmt.Printf("Extracting %s to %s\n", driverPath, absSrc)
+	if err := utils.ExtractTar(driverPath, absSrc); err != nil {
+		return fmt.Errorf("extract NVIDIA driver: %w", err)
+	}
+
+	extractedDir := filepath.Join(absSrc, "open-gpu-kernel-modules-"+version)
+	kernelSrc := filepath.Join(absSrc, "linux-"+kernelVersion)
+
+	// TODO: drop once https://github.com/NVIDIA/open-gpu-kernel-modules/pull/940 merges
+	makefilePath := filepath.Join(extractedDir, "kernel-open/Makefile")
+	if err := utils.Run("", "sed", []string{"-i", "s/MODLIB :=/MODLIB ?=/g", makefilePath}); err != nil {
+		return fmt.Errorf("patch NVIDIA Makefile: %w", err)
+	}
+
+	release, err := kernelRelease(kernelSrc)
+	if err != nil {
+		return err
+	}
+	dst := destDir(absSrc)
+	modlib := fmt.Sprintf("%s/Core/LibKit/modules/%s", dst, release)
+	common := []string{
+		"KERNEL_SOURCE=" + kernelSrc,
+		"KERNEL_MODLIB=" + modlib,
+		"KERNEL_UNAME=" + release,
+	}
+
+	if err := utils.Make(extractedDir, "modules", common...); err != nil {
+		return err
+	}
+	if err := utils.Make(extractedDir, "modules_install",
+		append(common, "INSTALL_MOD_PATH="+dst+"/Core/LibKit")...); err != nil {
+		return err
 	}
 	return nil
-}
-
-func BuildNvidiaDriver(out *os.File, version, src string) {
-	fmt.Println("Building NVIDIA driver...")
-	// Extract the tar.gz file
-	fmt.Printf("Extracting %s to %s\n", out.Name(), src)
-	pwd := filepath.Dir(out.Name())
-	pwd, _ = filepath.Abs(pwd)
-	fmt.Printf("Current working directory: %s\n", pwd)
-
-	err := utils.ExtractTar(out.Name(), src)
-	if err != nil {
-		fmt.Println("Error extracting NVIDIA driver:", err)
-		return
-	}
-
-	fmt.Println("NVIDIA driver extracted successfully")
-	// Change directory to the extracted folder
-	extractedDir := fmt.Sprintf("%s/open-gpu-kernel-modules-%s", src, version)
-	// Run make with all cores
-
-	//TODO: remove this if https://github.com/NVIDIA/open-gpu-kernel-modules/pull/940 is merged
-	//replace "MODLIB :=" with "MODLIB ?=" in extractedDir/kernel-open/Makefile file, using sed -i 's/MODLIB :=/MODLIB ?=/g' filename
-	makefilePath := fmt.Sprintf("%s/kernel-open/Makefile", extractedDir)
-	cmd := exec.Command("sed", "-i", "s/MODLIB :=/MODLIB ?=/g", makefilePath)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	err = cmd.Run()
-	if err != nil {
-		fmt.Println("Error modifying Makefile:", err)
-		return
-	}
-
-	utils.MakeWithAllCores(extractedDir, "modules", fmt.Sprintf("KERNEL_SOURCE=%s/%s/linux-%s", pwd, src, version), fmt.Sprintf("KERNEL_MODLIB=%s/output/modules/lib/modules/6.17.0-rovelos-1", pwd), fmt.Sprintf("KERNEL_UNAME=%s", "6.17.0-rovelos-1"))
-	utils.MakeWithAllCores(extractedDir, "modules_install", fmt.Sprintf("KERNEL_SOURCE=%s/%s/linux-%s", pwd, src, version), fmt.Sprintf("KERNEL_MODLIB=%s/output/modules/lib/modules/6.17.0-rovelos-1", pwd), fmt.Sprintf("KERNEL_UNAME=%s", "6.17.0-rovelos-1"),
-		fmt.Sprintf("INSTALL_MOD_PATH=%s/output/modules", pwd))
 }
