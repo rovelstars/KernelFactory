@@ -2,6 +2,7 @@ package builder
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,16 +13,39 @@ import (
 	"KernelFactory/utils"
 )
 
-// kernelRelease asks the kernel build for its true release string (VERSION +
-// localversion), e.g. "6.17.0-runixos-26.2". This is the single source of
-// truth for module directory names, so kernel and NVIDIA modules always agree.
-// Must be called after the config is in place.
-func kernelRelease(kernelSrc string) (string, error) {
-	out, err := exec.Command("make", "-s", "-C", kernelSrc, "kernelrelease").Output()
+// makeQuery runs a silent make target that just prints a value (e.g.
+// kernelrelease, image_name) and returns the trimmed output.
+func makeQuery(kernelSrc, target string) (string, error) {
+	out, err := exec.Command("make", "-s", "-C", kernelSrc, target).Output()
 	if err != nil {
-		return "", fmt.Errorf("make kernelrelease: %w", err)
+		return "", fmt.Errorf("make %s: %w", target, err)
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// kernelRelease returns the kernel's true release string (VERSION +
+// localversion), e.g. "7.0.11-runixos-26.2". Single source of truth for module
+// directory names, so kernel and NVIDIA modules always agree. Needs the config.
+func kernelRelease(kernelSrc string) (string, error) {
+	return makeQuery(kernelSrc, "kernelrelease")
+}
+
+// copyFile copies src to dst, truncating dst.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Sync()
 }
 
 // reproducibleEnv returns kbuild env vars that make the build deterministic.
@@ -55,12 +79,15 @@ func BuildKernel(kernelPath, kernelVersion, runixosVersion, src, borePatchURL st
 		return fmt.Errorf("resolve src: %w", err)
 	}
 
-	fmt.Printf("Extracting %s to %s\n", kernelPath, absSrc)
-	if err := utils.ExtractTar(kernelPath, absSrc); err != nil {
-		return fmt.Errorf("extract kernel: %w", err)
-	}
-
 	kernelSrc := filepath.Join(absSrc, "linux-"+kernelVersion)
+	if _, err := os.Stat(kernelSrc); os.IsNotExist(err) {
+		fmt.Printf("Extracting %s to %s\n", kernelPath, absSrc)
+		if err := utils.ExtractTar(kernelPath, absSrc); err != nil {
+			return fmt.Errorf("extract kernel: %w", err)
+		}
+	} else {
+		fmt.Printf("Kernel source already present at %s; skipping extract\n", kernelSrc)
+	}
 
 	localVersion := fmt.Sprintf("-runixos-%s", runixosVersion)
 	if err := SetLocalVersion(kernelSrc, localVersion); err != nil {
@@ -102,10 +129,27 @@ func BuildKernel(kernelPath, kernelVersion, runixosVersion, src, borePatchURL st
 
 	dst := destDir(absSrc)
 
-	// Kernel image -> Core/Startup
-	if err := utils.Make(kernelSrc, "install",
-		append(buildEnv, "INSTALL_PATH="+dst+"/Core/Startup")...); err != nil {
+	// Install the kernel image, System.map and config to Core/Startup. We copy
+	// directly rather than `make install`, which hands off to the host's
+	// /sbin/installkernel (systemd kernel-install), ignores INSTALL_PATH, and
+	// tries to write to /boot.
+	startup := filepath.Join(dst, "Core/Startup")
+	if err := os.MkdirAll(startup, 0755); err != nil {
 		return err
+	}
+	image, err := makeQuery(kernelSrc, "image_name") // e.g. arch/x86/boot/bzImage
+	if err != nil {
+		return err
+	}
+	artifacts := map[string]string{
+		filepath.Join(kernelSrc, image):        filepath.Join(startup, "vmlinuz-"+release),
+		filepath.Join(kernelSrc, "System.map"): filepath.Join(startup, "System.map-"+release),
+		filepath.Join(kernelSrc, ".config"):    filepath.Join(startup, "config-"+release),
+	}
+	for from, to := range artifacts {
+		if err := copyFile(from, to); err != nil {
+			return fmt.Errorf("install %s: %w", filepath.Base(to), err)
+		}
 	}
 
 	// Modules -> Core/LibKit/modules/<release>. MODLIB is set explicitly so
@@ -132,7 +176,13 @@ func applyBorePatch(kernelSrc, url string) error {
 			return fmt.Errorf("download bore patch: %w", err)
 		}
 	}
-	if err := utils.Run(kernelSrc, "patch", []string{"-p1", "-i", patchPath}); err != nil {
+	// Idempotent: a reverse dry-run succeeds only when the patch is already
+	// applied, so re-runs skip it instead of failing.
+	if utils.Run(kernelSrc, "patch", []string{"-p1", "-R", "-f", "--dry-run", "-i", patchPath}) == nil {
+		fmt.Println("BORE patch already applied; skipping")
+		return nil
+	}
+	if err := utils.Run(kernelSrc, "patch", []string{"-p1", "-f", "-i", patchPath}); err != nil {
 		return fmt.Errorf("apply bore patch: %w", err)
 	}
 	fmt.Println("BORE patch applied")
@@ -393,12 +443,15 @@ func BuildNvidiaDriver(driverPath, version, kernelVersion, runixosVersion, src s
 		return fmt.Errorf("resolve src: %w", err)
 	}
 
-	fmt.Printf("Extracting %s to %s\n", driverPath, absSrc)
-	if err := utils.ExtractTar(driverPath, absSrc); err != nil {
-		return fmt.Errorf("extract NVIDIA driver: %w", err)
-	}
-
 	extractedDir := filepath.Join(absSrc, "open-gpu-kernel-modules-"+version)
+	if _, err := os.Stat(extractedDir); os.IsNotExist(err) {
+		fmt.Printf("Extracting %s to %s\n", driverPath, absSrc)
+		if err := utils.ExtractTar(driverPath, absSrc); err != nil {
+			return fmt.Errorf("extract NVIDIA driver: %w", err)
+		}
+	} else {
+		fmt.Printf("NVIDIA source already present at %s; skipping extract\n", extractedDir)
+	}
 	kernelSrc := filepath.Join(absSrc, "linux-"+kernelVersion)
 
 	// TODO: drop once https://github.com/NVIDIA/open-gpu-kernel-modules/pull/940 merges
