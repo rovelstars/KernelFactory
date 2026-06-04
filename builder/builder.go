@@ -479,7 +479,9 @@ func BuildNvidiaDriver(driverPath, version, kernelVersion, runixosVersion, src s
 	if err := utils.Make(extractedDir, "modules "+common); err != nil {
 		return err
 	}
-	if err := utils.Make(extractedDir, "modules_install "+common+" INSTALL_MOD_PATH="+dst+"/Core/LibKit DEPMOD=/bin/true"); err != nil {
+	// MODLIB (not INSTALL_MOD_PATH) so NVIDIA modules land in the same
+	// Core/LibKit/modules/<release> as the kernel's, not Core/LibKit/lib/modules.
+	if err := utils.Make(extractedDir, "modules_install "+common+" MODLIB="+modlib+" DEPMOD=/bin/true"); err != nil {
 		return err
 	}
 	return nil
