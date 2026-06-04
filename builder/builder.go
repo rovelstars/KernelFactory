@@ -159,8 +159,12 @@ func BuildKernel(kernelPath, kernelVersion, runixosVersion, src, borePatchURL st
 	// '=', so an environment value would be ignored). Passing it as an argument
 	// installs modules straight to Core/LibKit/modules/<release> instead of the
 	// default /lib/modules.
+	// DEPMOD=/bin/true: skip depmod here. depmod derives its search base from
+	// the stock <base>/lib/modules layout, which RunixOS's Core/LibKit/modules
+	// does not match, so it must run later (image assembly / first boot) with a
+	// RunixOS-aware module path. We only need the .ko files staged now.
 	modlib := fmt.Sprintf("%s/Core/LibKit/modules/%s", dst, release)
-	if err := utils.Make(kernelSrc, "modules_install MODLIB="+modlib, buildEnv...); err != nil {
+	if err := utils.Make(kernelSrc, "modules_install MODLIB="+modlib+" DEPMOD=/bin/true", buildEnv...); err != nil {
 		return err
 	}
 
@@ -475,7 +479,7 @@ func BuildNvidiaDriver(driverPath, version, kernelVersion, runixosVersion, src s
 	if err := utils.Make(extractedDir, "modules "+common); err != nil {
 		return err
 	}
-	if err := utils.Make(extractedDir, "modules_install "+common+" INSTALL_MOD_PATH="+dst+"/Core/LibKit"); err != nil {
+	if err := utils.Make(extractedDir, "modules_install "+common+" INSTALL_MOD_PATH="+dst+"/Core/LibKit DEPMOD=/bin/true"); err != nil {
 		return err
 	}
 	return nil
