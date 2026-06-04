@@ -155,9 +155,12 @@ func BuildKernel(kernelPath, kernelVersion, runixosVersion, src, borePatchURL st
 	// Modules -> Core/LibKit/modules/<release>. MODLIB is set explicitly so
 	// modules land directly there (kbuild would otherwise append lib/modules),
 	// and so NVIDIA modules install alongside the kernel's.
+	// MODLIB must be a make command-line override (the Makefile assigns it with
+	// '=', so an environment value would be ignored). Passing it as an argument
+	// installs modules straight to Core/LibKit/modules/<release> instead of the
+	// default /lib/modules.
 	modlib := fmt.Sprintf("%s/Core/LibKit/modules/%s", dst, release)
-	if err := utils.Make(kernelSrc, "modules_install",
-		append(buildEnv, "MODLIB="+modlib)...); err != nil {
+	if err := utils.Make(kernelSrc, "modules_install MODLIB="+modlib, buildEnv...); err != nil {
 		return err
 	}
 
@@ -191,8 +194,7 @@ func applyBorePatch(kernelSrc, url string) error {
 
 func installHeaders(kernelSrc, dst string, buildEnv []string) error {
 	hdrTmp := filepath.Join(dst, "Core/.hdrtmp")
-	if err := utils.Make(kernelSrc, "headers_install",
-		append(buildEnv, "INSTALL_HDR_PATH="+hdrTmp)...); err != nil {
+	if err := utils.Make(kernelSrc, "headers_install INSTALL_HDR_PATH="+hdrTmp, buildEnv...); err != nil {
 		return err
 	}
 	includeDir := filepath.Join(hdrTmp, "include")
@@ -466,17 +468,14 @@ func BuildNvidiaDriver(driverPath, version, kernelVersion, runixosVersion, src s
 	}
 	dst := destDir(absSrc)
 	modlib := fmt.Sprintf("%s/Core/LibKit/modules/%s", dst, release)
-	common := []string{
-		"KERNEL_SOURCE=" + kernelSrc,
-		"KERNEL_MODLIB=" + modlib,
-		"KERNEL_UNAME=" + release,
-	}
+	// Pass the kernel vars as make command-line overrides (same reason as the
+	// kernel's MODLIB above).
+	common := fmt.Sprintf("KERNEL_SOURCE=%s KERNEL_MODLIB=%s KERNEL_UNAME=%s", kernelSrc, modlib, release)
 
-	if err := utils.Make(extractedDir, "modules", common...); err != nil {
+	if err := utils.Make(extractedDir, "modules "+common); err != nil {
 		return err
 	}
-	if err := utils.Make(extractedDir, "modules_install",
-		append(common, "INSTALL_MOD_PATH="+dst+"/Core/LibKit")...); err != nil {
+	if err := utils.Make(extractedDir, "modules_install "+common+" INSTALL_MOD_PATH="+dst+"/Core/LibKit"); err != nil {
 		return err
 	}
 	return nil
