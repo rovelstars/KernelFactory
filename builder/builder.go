@@ -307,6 +307,19 @@ CONFIG_DM_THIN_PROVISIONING=y
 CONFIG_DM_SNAPSHOT=y
 CONFIG_PARTITION_ADVANCED=y
 
+# === RunixOS: deployments, integrity, early boot ===
+CONFIG_BLK_DEV_INITRD=y         # load the RunixOS initramfs (assembles /Core, execs Rev)
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+CONFIG_TMPFS=y
+CONFIG_TMPFS_POSIX_ACL=y
+CONFIG_OVERLAY_FS=y             # composefs (EROFS + overlay + fs-verity) for /Core deployments
+CONFIG_BLK_DEV_DM=y
+CONFIG_DM_VERITY=y              # signed verity-sealed /Core image
+CONFIG_DM_CRYPT=y               # dm-crypt for user-data full-disk encryption
+CONFIG_UNIX=y                   # unix domain sockets (Rev / WireBus IPC)
+CONFIG_IO_URING=y               # WireBus performance path
+
 # === RAID & Block ===
 CONFIG_MD=y
 CONFIG_BLK_DEV_MD=y
