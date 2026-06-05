@@ -1,8 +1,8 @@
 # KernelFactory
 
-🌽 Kernel Factory for RovelOS/Linux
+🌽 Kernel Factory for RunixOS/Linux
 
-This project automates the downloading and building of Linux kernels with specific patches and out-of-tree modules like NVIDIA drivers, tailored for RovelOS/Linux.
+This project automates the downloading and building of Linux kernels with specific patches and out-of-tree modules like NVIDIA drivers, tailored for RunixOS/Linux.
 
 ## Features
 

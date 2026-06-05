@@ -152,6 +152,16 @@ func BuildKernel(kernelPath, kernelVersion, runixosVersion, src, borePatchURL st
 		}
 	}
 
+	// Also install a stable, unversioned kernel name. The bootloader (Rignite)
+	// looks for Core/Startup/vmlinuz-runixos so it can boot without knowing the
+	// release string; the versioned vmlinuz-<release> stays for keeping several
+	// kernels around. A copy (not a symlink) so it survives a copy to the FAT
+	// ESP, which has no symlinks.
+	stable := filepath.Join(startup, "vmlinuz-runixos")
+	if err := copyFile(filepath.Join(kernelSrc, image), stable); err != nil {
+		return fmt.Errorf("install vmlinuz-runixos: %w", err)
+	}
+
 	// Modules -> Core/LibKit/modules/<release>. MODLIB is set explicitly so
 	// modules land directly there (kbuild would otherwise append lib/modules),
 	// and so NVIDIA modules install alongside the kernel's.
